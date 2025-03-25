@@ -1,0 +1,35 @@
+workdir: "/path/to/outputs"
+
+# must install nupack into a conda environment with biopython
+nupack_env: "nupack"
+
+experiments:
+  # three_utr:  # name used in filename
+  #   estimate:
+  #     - monomer
+  #     - dimer
+  #   # all sequences are used for monomer calculations.  If doing dimer estimates,
+  #   # must also contain all sequences in dimer pairs
+  #   # to convert csv to fa:
+  #   # `tail -n+2 {input.csv} | awk -v FS=, '{print ">" $1 "\n" $2}' > {output.fa}
+  #   # to remove sequence unavailable
+  #   # `awk 'BEGIN {RS=">" ; FS="\n"} $2 !~ /Sequence unavailable/{print ">" $0}' {input.fa} | sed -E '/^>?$/d' > {output.fa}`
+  #   input_fasta: "3_utrs.fa"
+  #   # csv with first two columns containing fasta ids to measure dimer FE
+  #   paired_csv: "3_utr_dimers.csv"
+  #   # can optionally specify a subset of the fasta csv
+  #   monomer_csv: "3_utr_monomers.csv"
+
+  human_hek:
+    estimate:
+      - dimer
+    input_fasta: "sequences/human.fa"
+    paired_csv: "sequences/dimerFE.csv"
+
+paths:
+  config: "logs/config_{date}.yaml"
+  slurm_output: "logs/slurm"
+
+  split_fasta: "{experiment}/{estimate}/fastas/split/{sample}_{max_len}.fa"
+  split_fe: "{experiment}/{estimate}/free_energy/split/{sample}_{max_len}.txt"
+  joined_fe: "{experiment}/{estimate}/free_energy/joined.txt.gz"

@@ -1,0 +1,8 @@
+channels:
+  - conda-forge
+dependencies:
+  - pandas =1.5
+  - jupyter =1.0
+  - numpy =1.23
+  - matplotlib =3.6
+  - seaborn =0.12

@@ -1,0 +1,170 @@
+from datetime import datetime
+import functools
+import numpy as np
+
+scripts = Path(workflow.basedir) / 'scripts'
+
+configfile: 'config/config.yaml'
+
+paths = config['paths']
+workdir: config['workdir']
+
+os.makedirs(paths['slurm_output'], exist_ok=True)
+
+localrules:
+    log_config,
+    split_monomer_fasta,
+    split_dimer_fasta,
+    join_FE,
+
+joined_fes = [
+        paths['joined_fe'].format(
+            experiment=experiment, 
+            estimate=estimate, 
+            )
+        for experiment, value in config['experiments'].items()
+        for estimate in value['estimate']
+        ]
+rule all:
+    input:
+        expand(paths['config'], date=datetime.now().strftime('%Y.%m.%d')),
+        joined_fes,
+
+rule log_config:
+    '''
+    Copy config and place in logs folder with the date run
+    '''
+    output:
+        paths['config']
+    run:
+        import yaml
+        with open(output[0], 'w') as outfile:
+            yaml.dump(config, outfile, default_flow_style=False)
+
+def get_exp_input(keys, optional=None):
+    def inner(wildcards):
+        exp = config['experiments'][wildcards.experiment]
+        result = [ exp.get(key) for key in keys ]
+        if optional in exp:
+            result.append(exp.get(optional))
+        return result
+    return inner
+
+checkpoint split_monomer_fasta:
+    output:
+        directory(Path(paths['split_fasta']).parent)
+    input: get_exp_input(['input_fasta'], 'monomer_csv')
+    wildcard_constraints:
+        estimate='monomer'
+    conda:
+        config['nupack_env']
+    shell:  # must be shell for conda with local env to work
+        'python {scripts}/split_fasta.py '
+            '{input:q} '
+            '{output} '
+
+checkpoint split_dimer_fasta:
+    output:
+        directory(Path(paths['split_fasta']).parent)
+    input: get_exp_input(['input_fasta', 'paired_csv'])
+    wildcard_constraints:
+        estimate='dimer'
+    conda:
+        config['nupack_env']
+    shell:  # must be shell for conda with local env to work
+        'python {scripts}/split_fasta.py '
+            '{input:q} '
+            '{output} '
+
+@functools.cache
+def pred_resources(max_size, analysis):
+    max_size = int(max_size)
+    max_rss = pred_rss(max_size, analysis)
+    total_time = pred_time(max_size, analysis)
+    cpus = np.ceil(np.clip(max_rss / 20000, 1, 20))
+    time = total_time / cpus
+    return int(max_rss), int(time), int(cpus)
+
+def pred_time(max_size, analysis):
+    parameters = {
+            'monomer': [ 2.05496072e-06, -1.26717081e-02,  4.20135600e+01],
+            'dimer': [ 2.07712937e-06, -1.00625546e-02,  1.72087269e+01],
+            }
+    fit = reversed(parameters[analysis])
+    min_time = 63
+    est = sum(param * max_size ** order for order, param in enumerate(fit)) / 0.6
+    # must be above minimum
+    return np.maximum(est, min_time)
+
+def pred_rss(max_size, analysis):
+    parameters = {
+            'monomer': [ 2.25781141e-04, -5.44149562e-02,  7.49893677e+02],
+            'dimer': [ 1.45083155e-04,  8.95635272e-01, -4.64104769e+03],
+            }
+    fit = reversed(parameters[analysis])
+    min_rss = 4*1024
+    est = sum(param * max_size ** order for order, param in enumerate(fit)) / 0.8
+    # must be above minimum
+    return np.maximum(est, min_rss)
+
+rule monomer_FE:
+    input:
+        paths['split_fasta']
+    output:
+        temp(paths['split_fe'])
+    wildcard_constraints:
+        estimate='monomer'
+    conda:
+        config['nupack_env']
+    threads: lambda wildcards: pred_resources(wildcards.max_len, 'monomer')[2]
+    resources:
+        mem_mb=lambda wildcards, attempt: pred_resources(wildcards.max_len, 'monomer')[0] * attempt,
+        runtime=lambda wildcards, attempt: pred_resources(wildcards.max_len, 'monomer')[1] * attempt,
+    shell:  # must be shell for conda with local env to work
+        'python {scripts}/monomer_FE.py '
+            '{input} '
+            '{output} '
+
+rule dimer_FE:
+    input:
+        paths['split_fasta']
+    output:
+        temp(paths['split_fe'])
+    wildcard_constraints:
+        estimate='dimer'
+    conda:
+        config['nupack_env']
+    threads: lambda wildcards: pred_resources(wildcards.max_len, 'dimer')[2]
+    resources:
+        mem_mb=lambda wildcards, attempt: pred_resources(wildcards.max_len, 'dimer')[0] * attempt,
+        runtime=lambda wildcards, attempt: pred_resources(wildcards.max_len, 'dimer')[1] * 1.5 * attempt,
+    shell:  # must be shell for conda with local env to work
+        'python {scripts}/dimer_FE.py '
+            '{input} '
+            '{output} '
+
+def join_FE_input(wildcards):
+    if wildcards.estimate == 'monomer':
+        checkpoints.split_monomer_fasta.get(**wildcards).output
+    elif wildcards.estimate == 'dimer':
+        checkpoints.split_dimer_fasta.get(**wildcards).output
+    else:
+        raise ValueError(f'Unknown estimate "{wildcards.estimate}"')
+    wcs = glob_wildcards(
+            expand(paths['split_fasta'],
+                   estimate=wildcards.estimate,
+                   experiment=wildcards.experiment,
+                   allow_missing=True)[0]
+            )
+    return expand(
+            expand(paths['split_fe'],
+                   estimate=wildcards.estimate,
+                   experiment=wildcards.experiment,
+                   allow_missing=True),
+            zip, sample=wcs.sample, max_len=wcs.max_len)
+
+rule join_FE:
+    input: join_FE_input
+    output: paths['joined_fe']
+    shell:
+        'cat {input} | gzip > {output}'

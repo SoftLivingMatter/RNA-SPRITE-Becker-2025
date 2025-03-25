@@ -1,0 +1,666 @@
+from datetime import datetime
+from collections import defaultdict
+
+scripts = Path(workflow.basedir) / 'scripts'
+
+configfile: 'config/parameters.yaml'
+configfile: 'config/paths.yaml'
+
+paths = config['paths']
+workdir: config['workdir']
+
+os.makedirs(paths['slurm_output'], exist_ok=True)
+
+num_tags = 5
+if 'num_tags' in config:
+    num_tags = config['num_tags']
+print(f'Using {num_tags} tags')
+
+fastqs = defaultdict(dict)
+samples = set()
+reads = set()
+
+for name, fastq in config['input_fastq'].items():
+    wcs = glob_wildcards(fastq)
+    for samp, wc in zip(wcs.sample, zip(*wcs)):
+        # build a dict for this file, need to use _fields since wildcards could change
+        sample_wcs = dict(zip(wcs._fields, wc))
+        # suppress read formatting
+        sample_wcs['read'] = '{read}'
+        # generate filename with read
+        fastqs[samp][name] = fastq.format(**sample_wcs)
+        samples |= set(wcs.sample)
+        reads |= set(wcs.read)
+
+samples=sorted(samples)
+reads=sorted(reads)
+
+print(f'Found {len(samples)} samples')
+print(f'Using reads {reads}, assuming "{reads[1]}" has tags')
+
+trimmomatic="java -jar /projects/BRANGWYNNE/tools/genomics/software/Trimmomatic/Trimmomatic-0.39/trimmomatic-0.39.jar"
+
+ruleorder:
+    combine_clusters >
+    combine_counts >
+    make_merged_clusters > 
+    count_raw_reads > 
+
+cdna_desc = 'aligned.cDNAandncRNA' if config['map_cdna_by'] == 'bowtie' else 'Aligned.toTranscriptome.out'
+rule all:
+    input:
+        expand(paths['config'], date=datetime.now().strftime('%Y.%m.%d')),
+        expand(paths['clusters_csv'],
+               sample=[
+                   'full_barcode',
+                   'full_barcode_no_singles',
+                   ],
+               dedup_by=[
+                   'name',
+                   'position',
+                   ],
+               ),
+        expand(paths['aligned_files'],
+               step='raw_reads',
+               sample='OVERALL',
+               desc=['aligned.Hsrepeat2', cdna_desc],
+               ext='tsv',
+               ),
+        paths['cluster_qc'],
+        paths['cluster_ligation'],
+        paths['multiqc'],
+        paths['ligation_qc'] + 'tag_plates.svg',
+
+onerror: 
+    if 'email' in config:
+        shell(
+                "sed -n '/^Error/,/^\[/p' {log}"  # print errors
+                '| cut -c -300 '  # limit to 300 chars wide
+                '| head -n 100'  # limit to first 100 lines
+                '| mail -s "SPRITE Error" '
+                + config['email'])
+
+localrules:
+    log_config,
+    produce_bID,
+    multiqc,
+    ligation_qc,
+    report_tag_ligation,
+
+def pformat(string, **args):
+    '''parital formating of wildcards'''
+    return expand(string, **args, allow_missing=True)
+
+def aligned(step, ext, do_zip=False, **args):
+    if do_zip:
+        return expand(paths['aligned_files'],
+                      zip,
+                      step=step,
+                      ext=ext,
+                      **args,
+                      allow_missing=True)
+    return expand(paths['aligned_files'],
+                  step=step,
+                  ext=ext,
+                  **args,
+                  allow_missing=True)
+
+def zip_sample_reps(path, **args):
+    result = []
+    for sample, reps in fastqs.items():
+        for rep, file in reps.items():
+                result += expand(path,
+                                 zip,  # not entirely needed
+                                 sample=sample,
+                                 replicate=rep,
+                                 allow_missing=True)
+    return expand(result, **args)
+
+rule log_config:
+    '''
+    Copy config and place in logs folder with the date run
+    '''
+    output:
+        paths['config']
+    run:
+        import yaml
+        with open(output[0], 'w') as outfile:
+            yaml.dump(config, outfile, default_flow_style=False)
+
+rule produce_bID:
+    input:
+        template=config['bID_template'],
+        plate=config['bID_plate'],
+    output:
+        config['bID']
+    run:
+        # super ancient to never update bid once it exists
+        if Path(output[0]).exists():
+            print('bID already exists, not regenerating')
+            return
+        # build dict for plate
+        plate_map = {f'{row}{col}' : token
+                for row, line in zip('ABCDEFGH', open(input.plate))
+                for col, token in enumerate(line.strip().split(','), start=1)
+                }
+        assert len(plate_map) == 96, f'Unset plate values, only found {len(plate_map)}'
+
+        with open(input.template) as infile, open(output[0], 'w') as outfile:
+            outfile.write(infile.read().format(**plate_map))
+
+        # format template
+
+def fastq_mv_cmds(wildcards, input, output):
+    # this assumes the input and output expands are the same order, and ext is last
+    opt = iter(output)
+    # this python groups the infile with the two outfiles
+    result = []
+    for infile, outfile1, outfile2 in zip(input, opt, opt):
+        infile = Path(infile).name
+        # get filename like fastqc
+        infile = infile.removesuffix('.gz')
+        infile = infile.removesuffix('.fastq')
+        infile = infile.removesuffix('.fq')
+        # get extensions
+        outfile1_ext = Path(outfile1).suffix
+        outfile2_ext = Path(outfile2).suffix
+        # move outputs to expected location
+        result.append(f'mv "${{TEMP_DIR}}/{infile}_fastqc{outfile1_ext}" "{outfile1}"')
+        result.append(f'mv "${{TEMP_DIR}}/{infile}_fastqc{outfile2_ext}" "{outfile2}"')
+    return '\n'.join(result)
+
+rule fastqc:
+    input:
+        lambda wildcards: expand(fastqs[wildcards.sample][wildcards.replicate], read=reads)
+    output:
+        expand(paths['fastqc'], read=reads, ext=('html', 'zip'), allow_missing=True)
+    container: config['containers']['fastqc']
+    params:
+        mv_cmds=fastq_mv_cmds
+    threads:
+        1
+    resources:
+        runtime=120,
+        mem_mb=2000
+    shell:
+        'TEMP_DIR="$(mktemp -d)"\n'  # keep each sample in a different temp dir
+        'trap \'rm -rf -- "$TEMP_DIR"\' EXIT \n'  # cleanup temp dir on exit
+        'fastqc '
+            '--threads {threads} '
+            '--outdir "$TEMP_DIR" '
+            '{input}\n'  # run fastqc
+        '{params.mv_cmds}\n'  # move outputs
+
+def adaptor_trimming_pe_input(wildcards):
+    return expand(fastqs[wildcards.sample][wildcards.replicate], read=reads)
+
+rule adaptor_trimming_pe:
+    input: adaptor_trimming_pe_input
+    output:
+        fastq=pformat(paths['trimmed_fastq'], read=reads),
+        unpaired=temp(pformat(paths['trimmed_unpaired'], read=reads)),
+    threads:
+        1
+    resources:
+        runtime=750,
+        mem_mb=2000
+    log:
+        'logs/trimming/{replicate}/{sample}.trimmomatic.log'
+    shell:
+        '{trimmomatic} PE '
+            '-threads {threads} '
+            '-phred33 '
+            '{input} '
+            '{output.fastq[0]} '
+            '{output.unpaired[0]} '
+            '{output.fastq[1]} '
+            '{output.unpaired[1]} '
+            '{config[trimmomatic]} '
+            '2> {log}'
+
+rule barcode_id:
+    '''Identify barcodes using BarcodeIdentification'''
+    input:
+        pformat(paths['trimmed_fastq'], read=reads),
+        bid=config['bID'],
+        script=scripts / "java/BarcodeIdentification_v1.2.0.jar",
+    output:
+        temp(pformat(paths['barcode_fastq'], read=reads)),
+    threads:
+        1
+    resources:
+        runtime=300,
+        mem_mb=1000
+    shell:
+        "java "
+            "-jar {input.script} "
+            "--input1 {input[0]} "
+            "--input2 {input[1]} "
+            "--output1 {output[0]} "
+            "--output2 {output[1]} "
+            "--config {input.bid}"
+
+rule filter_not_found:
+    input:
+        fastq=paths['barcode_fastq']
+    output:
+        pipe(paths['filtered_fastq'])
+    params:
+        sed_command=(
+                r'/^@/ '  # match lines starting with @ (fastq header)
+                r'{ N; '  # read the next line
+                r'/^+\n@/! '  # make sure the @ doesn't have a + before (quality)
+                r'{ N; N; /NOT_FOUND/!p } }'  # read 2 more lines and check NOT_FOUND is absent
+                )
+    shell:
+        'zcat {input.fastq} '
+            '| sed -n \'{params.sed_command}\' '
+            '> {output} '
+
+rule map_nc_rna:
+    input:
+        fastq=pformat(paths['filtered_fastq'], read=reads[0]),
+        bt2_index=multiext(config['bowtie2_repeat_reference'],
+                '.1.bt2',
+                '.2.bt2',
+                '.3.bt2',
+                '.4.bt2',
+                '.rev.1.bt2',
+                '.rev.2.bt2',
+                )
+    output:
+        sam=pipe(aligned('{replicate}/nc_rna', 'sam', desc='aligned.Hsrepeat2')),
+        unaligned=aligned('{replicate}/nc_rna', 'fastq', desc='unaligned'),
+    container: config['containers']['bowtie2']
+    params: 
+        genome=lambda wildcards, input: input['bt2_index'][0][:-6]
+    threads:
+        1
+    resources:
+        runtime=60 * 23,
+        mem_mb=2000
+    log:
+        'logs/{replicate}/nc_rna/{sample}.Hsrepeat2.bowtie.log'
+    shell:
+        'bowtie2 '
+            '{config[bowtie_map_nc_rna]} '
+            '-x {params.genome} '
+            '-U {input.fastq} '
+            '--un {output.unaligned} '
+            '> {output.sam} '
+            '2> {log} '
+
+rule map_cDNA_bowtie:
+    input:
+        fastq=aligned('{replicate}/nc_rna', 'fastq', desc='unaligned'),
+        bt2_index=multiext(config['bowtie2_reference'],
+                '.1.bt2',
+                '.2.bt2',
+                '.3.bt2',
+                '.4.bt2',
+                '.rev.1.bt2',
+                '.rev.2.bt2',
+                )
+    output:
+        sam=pipe(aligned('{replicate}/cDNA', 'sam', desc='aligned.cDNAandncRNA')),
+        unaligned=aligned('{replicate}/cDNA', 'fastq.gz', desc='unaligned.cDNAandncRNA'),
+    container: config['containers']['bowtie2']
+    params:
+        genome=lambda wildcards, input: input['bt2_index'][0].removesuffix('.1.bt2')
+    threads:
+        1
+    resources:
+        runtime=120,
+        mem_mb=4000
+    log:
+        'logs/{replicate}/cDNA/{sample}.cDNAandncRNA.bowtie.log'
+    shell:
+        'bowtie2 '
+            '{config[bowtie_map_cdna]} '
+            '-x {params.genome} '
+            '-U {input.fastq} '
+            '--un {output.unaligned} '
+            '> {output.sam} '
+            '2> {log} '
+
+rule map_cDNA_star:
+    input:
+        fastq=aligned('{replicate}/nc_rna', 'fastq', desc='unaligned'),
+        genome=config['star_reference']
+    output:
+        temp(aligned('{replicate}/cDNA', 'sam', desc='Aligned.out')),
+        temp(aligned('{replicate}/cDNA', 'bam', desc='Aligned.toTranscriptome.out')),
+        aligned('{replicate}/cDNA', 'tab', desc=['SJ.out', 'ReadsPerGene.out']),
+        aligned('{replicate}/cDNA', 'mate1', desc='Unmapped.out'),
+    params:
+        prefix=lambda wildcards, output: output[0].removesuffix('.Aligned.out.sam'),
+    container:
+        config['containers']['star']
+    threads:
+        1
+    resources:
+        runtime=120,
+        mem_mb=32000
+    log:
+        'logs/{replicate}/cDNA/{sample}.cDNAandncRNA.Log.out',
+        'logs/{replicate}/cDNA/{sample}.cDNAandncRNA.Log.final.out',
+        'logs/{replicate}/cDNA/{sample}.cDNAandncRNA.Log.progress.out',
+    shell:
+        'STAR '
+            '--outFileNamePrefix {params.prefix}. '
+            '--genomeDir {input.genome} '
+            '--readFilesIn {input.fastq} '
+            '--runThreadN {threads} '
+            '--quantMode TranscriptomeSAM GeneCounts '
+            '{config[star_map_cDNA]} \n'
+        'mv {params.prefix}.Log.out logs/{wildcards.replicate}/cDNA\n'
+        'mv {params.prefix}.Log.final.out logs/{wildcards.replicate}/cDNA\n'
+        'mv {params.prefix}.Log.progress.out logs/{wildcards.replicate}/cDNA\n'
+
+def samtools_filter_input(wildcards):
+    extension = 'bam'
+    if 'Hsrepeat2' in wildcards.file:
+        extension = 'sam'
+    return f"{wildcards.file}.{extension}"
+
+rule samtools_filter:
+    input:
+        samtools_filter_input
+    output:
+        bam=temp('{file}.filtered.bam'),
+        bai=temp('{file}.filtered.bam.bai'),
+    container: config['containers']['samtools']
+    threads:
+        1
+    resources:
+        runtime=120,
+        mem_mb=8000
+    shell:
+        'samtools view -b '
+            '{config[samtools_filter]} '
+            '{input} | '
+        'samtools sort > {output.bam}\n'
+        'samtools index {output.bam}'
+
+def undedup_bams(wildcards):
+    step = '{replicate}/cDNA'
+    if 'Hsrepeat2' in wildcards.desc:
+        step = '{replicate}/nc_rna'
+    replicates = list(fastqs[wildcards.sample].keys())
+    return expand(aligned(step, 'filtered.bam', **wildcards), replicate=replicates)
+
+rule merge_replicates:
+    input:
+        bam=undedup_bams
+    wildcard_constraints:
+        desc=r"aligned.Hsrepeat2|aligned.cDNAandncRNA|Aligned.toTranscriptome.out"
+    output:
+        bam=temp(aligned('merged', 'bam'))
+    container: config['containers']['samtools']
+    threads:
+        1
+    resources:
+        runtime=240,
+        mem_mb=4000
+    shell:
+        'samtools merge '
+            '{output} '
+            '{input} '
+
+rule count_raw_reads:
+    input:
+        bam=aligned('merged', 'bam'),
+    output:
+        temp(aligned('raw_reads', 'tsv'))
+    container:
+        config['containers']['samtools']
+    threads: 1
+    resources:
+        runtime=33,
+        mem_mb=1000
+    params:
+        sed_command=(
+                r's/.*'  # match everything
+                r'\['  # literal [
+                r'([^]]+)'  # capture everything until a closing ]
+                r'_[A-H][0-9]+]\t'  # but also need a well and closing ]
+                r'/\1\t/'  # replace with captured group
+                )
+    shell:
+        'samtools view {input.bam} | '
+            'cut -f1,3 | '
+            "sed -E '{params.sed_command}' | "
+            'sort | '
+            'uniq -c '
+            '> {output} '
+
+rule combine_counts:
+    input:
+        aligned('{step}', 'tsv', sample=samples)
+    output:
+        aligned('{step}', 'tsv', sample='OVERALL')
+    wildcard_constraints:
+        step=r"raw_reads"
+    threads: 1
+    resources:
+        runtime=33,
+        mem_mb=1000
+    params:
+        awk_command=(
+                r'{counts[$2 "\t" $3] += $1} '  # record count (1) with key (2)
+                r'END {'  # at the end of all files
+                r'for (i in counts) '  # for each key in counts
+                r'{print i "\t" counts[i]}}'  # print key and summed counts
+                )
+    shell:
+        "awk '{params.awk_command}' "
+            "{input} "
+            "> {output}"
+
+rule add_barcode_to_bam:
+    input:
+        bam=aligned('merged', 'bam'),
+        script=scripts / "python/decode_barcode_to_BC.py",
+        bid=config['bID'],
+    output:
+        bam=temp(aligned('barcoded', 'bam')),
+    threads:
+        1
+    resources:
+        runtime=63,
+        mem_mb=4000
+    conda:
+        "envs/alignment.yaml"
+    shell:
+        'python {input.script} '
+            '--input-bam {input.bam} '
+            '--bid {input.bid} '
+            '--out-bam {output.bam}'
+
+rule markduplicate_removal:
+    input:
+        bam=aligned('barcoded', 'bam'),
+    output:
+        bam=temp(aligned('markduplicate', 'bam')),
+    threads:
+        1
+    resources:
+        runtime=63,
+        mem_mb=8000
+    log:
+        out='logs/markduplicates/{sample}.{desc}.log',
+        metric='logs/markduplicates/{sample}.{desc}.dupmetrics.txt'
+    container: config['containers']['gatk']
+    shell:
+        'gatk --java-options -Xmx$(({resources.mem_mb} * 8 / 10))M '
+            'MarkDuplicates '
+            '--INPUT {input.bam} '
+            '--OUTPUT {output.bam} '
+            '--METRICS_FILE {log.metric} '
+            '--REMOVE_DUPLICATES true '
+            '--BARCODE_TAG BC '
+            '2> {log.out} '
+
+rule dedup_by_tags:
+    input:
+        bam=aligned('markduplicate', 'bam'),
+        script=scripts / "python/remove_duplicates.py",
+    output:
+        bam=aligned('dedup', 'bam', desc="{desc}_dedup"),
+        counts=aligned('dedup', 'tsv', desc="{desc}_dedup_counts"),
+    conda:
+        "envs/alignment.yaml"
+    threads: 1
+    resources:
+        runtime=63,
+        mem_mb=32000
+    shell:
+        'python {input.script} '
+            '--input {input.bam} '
+            '--output {output.bam} '
+            '--counts {output.counts} '
+            '--num-tags {num_tags} '
+
+rule make_merged_clusters:
+    input:
+        bams=aligned('dedup', 'bam', desc=[
+            'aligned.Hsrepeat2_dedup',
+            f'{cdna_desc}_dedup',
+            ]),
+        script=scripts / "python/get_clusters.py",
+    output:
+        temp(pformat(paths['clusters'], sample='samples/{sample}'))  # store in subdir
+    conda:
+        "envs/alignment.yaml"
+    threads:
+        1
+    resources:
+        runtime=63,
+        mem_mb=64000
+    shell:
+        'python {input.script} '
+            '--input {input.bams} '
+            '--output {output} '
+            '--num_tags {num_tags} '
+            '--equality {wildcards.dedup_by} '
+
+rule report_tag_ligation:
+    input:
+        zip_sample_reps(paths['barcode_fastq'], read=reads[0]),
+    output:
+        paths['cluster_qc'],
+        paths['cluster_ligation'],
+    run:
+        from collections import Counter
+        import gzip
+        import re
+        import itertools
+
+        tag_matcher = re.compile(r'^@[^[]+' + r'\[([^[]+)\]' * num_tags)
+        with open(output[0], 'w') as tag_counts, open(output[1], 'w') as ligation:
+            tag_counts.write('position,tag,counts\n')
+
+            columns = ['sample']
+            columns += [f'{i}_barcodes' for i in range(num_tags+1)]
+            columns += [f'in_position_{i}' for i in range(1, num_tags+1)]
+            ligation.write(','.join(columns) + '\n')
+
+            counts = [Counter() for _ in range(num_tags)]
+            for sample, file in zip(samples, input):
+                num_barcodes = Counter()
+                in_position = Counter()
+                for line in itertools.islice(gzip.open(file, 'rt'), 0, None, 4):
+
+                    match = tag_matcher.match(line)
+
+                    tags = list(match.groups())
+
+                    num_barcodes[tags.count('NOT_FOUND')] += 1
+                    for position, (counter, tag) in enumerate(zip(counts, tags)):
+                        counter[tag] += 1
+                        if tag != 'NOT_FOUND':
+                            in_position[position] += 1
+
+                ligation.write(f'{sample},')
+                # need to enumerate in reverse since the counter holds the number not found
+                ligation.write(','.join(str(num_barcodes[i]) for i in range(num_tags, -1, -1)) + ',')
+                ligation.write(','.join(str(in_position[i]) for i in range(num_tags)) + '\n')
+
+            for position, counter in enumerate(counts):
+                position += 1
+                for tag, count in counter.items():
+                    tag_counts.write(f'{position},{tag},{count}\n')
+
+rule ligation_qc:
+    input:
+        ligation=paths['cluster_ligation'],
+        tags=paths['cluster_qc'],
+    output:
+        ligation=paths['ligation_qc'] + 'ligation_rates.svg',
+        tags=paths['ligation_qc'] + 'tag_plates.svg',
+    conda:
+        "envs/notebooks.yaml"
+    log:
+        notebook=paths['ligation_qc'] + 'summary.ipynb'
+    notebook:
+        'notebooks/ligation_summary.ipynb'
+
+rule multiqc:
+    input:
+        #needs to be the last file produced in the pipeline 
+        expand(pformat(paths['clusters'], sample='samples/{sample}'),
+                        sample=samples, dedup_by='name'),
+        zip_sample_reps(paths['fastqc'], read=reads, ext='html')
+    output:
+        paths['multiqc']
+    params:
+        outdir=Path(paths['multiqc']).parent
+    conda:
+        "envs/qc.yaml"
+    shell: 
+        "rm -rf {params.outdir}/* \n"  # clean up previous executions
+        "multiqc . -o {params.outdir}"
+
+rule combine_clusters:
+    input:
+        expand(pformat(paths['clusters'], sample='samples/{sample}'),
+                sample=samples, allow_missing=True),
+    output:
+        all_found=expand(paths['clusters'], sample='full_barcode', allow_missing=True),
+        no_singles_all_found=expand(paths['clusters'], sample='full_barcode_no_singles', allow_missing=True),
+    threads:
+        1
+    resources:
+        runtime=180,
+        mem_mb=1000
+    shell: 
+        'zcat {input} | '
+            'gzip > {output.all_found} \n '
+        'zcat {input} | '
+            'awk \'NF > 2\' | '
+            'gzip > {output.no_singles_all_found}'
+
+rule make_cluster_csv:
+    input:
+        all_found=expand(paths['clusters'], sample='full_barcode', allow_missing=True),
+    output:
+        all_found=expand(paths['clusters_csv'], sample='full_barcode', allow_missing=True),
+        no_singles=expand(paths['clusters_csv'], sample='full_barcode_no_singles', allow_missing=True),
+    threads:
+        1
+    resources:
+        runtime=60 * 24,
+        mem_mb=2000
+    run:
+        import gzip
+        with gzip.open(input[0], 'rt') as infile, \
+                gzip.open(output.all_found[0], 'wt') as all_found, \
+                gzip.open(output.no_singles[0], 'wt') as no_singles:
+            all_found.write('barcode,alignment\n')
+            no_singles.write('barcode,alignment\n')
+            for line in infile:
+                barcode, *seqs = line.split()
+                entry = '\n'.join(f'{barcode},{seq}' for seq in seqs)
+                if len(seqs) > 1:
+                    no_singles.write(entry + '\n')
+                all_found.write(entry + '\n')
