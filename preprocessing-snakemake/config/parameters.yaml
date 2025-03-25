@@ -1,0 +1,69 @@
+# base directory for results
+workdir: "/path/to/output"
+
+# email to which errors will be sent, delete or comment to suppress email
+# email: "you@email.com"
+
+# used to find sample names and verify reads
+input_fastq: 
+  rep1: "/path/to/your/fastq/{sample}-read-{read}.fastq.gz"
+
+# Location of the config file for barcodeIdentification
+# see barcode_id folder for an example
+bID: "barcodeIdentificationConfig.txt"
+# or use template and plate
+bID_template: "template.txt"
+bID_plate: "plate_layout.csv"
+
+#Number of barcodes used
+num_tags: 4
+
+# mapping, index is created as needed
+bowtie2_repeat_reference: "/path/to/repeat/reference"
+
+# run with unmapped reads from mapping to bowtie2 reference
+map_cdna_by: "star"
+star_reference: "/path/to/star/reference"
+bowtie2_reference: "/path/to/bowtie2/reference"
+
+trimmomatic: >-
+  ILLUMINACLIP:/path/to/trimmomatic_adapters/DummyRNASPRITE-TruSeq3-PE-2.fa:2:30:10:6:true
+  LEADING:10
+  TRAILING:10
+  MINLEN:25
+
+samtools_filter: >-
+  -F 4
+  -F 16
+  -F 256
+  -F 512
+  -F 1024
+
+bowtie_map_nc_rna: >-
+  --phred33
+  --local
+  --norc
+
+bowtie_map_cdna: >-
+  --phred33
+  --local
+
+star_map_cDNA: >-
+  --outFilterMatchNminOverLread 0.10
+  --outFilterIntronMotifs None
+  --alignIntronMax 50000
+  --alignMatesGapMax 1000
+  --genomeLoad NoSharedMemory
+  --alignIntronMin 80
+  --alignSJDBoverhangMin 5
+  --sjdbOverhang 100
+  --outSAMunmapped Within
+  --outReadsUnmapped Fastx
+  --outSAMmultNmax 1
+
+containers:
+  bowtie2: 'docker://biocontainers/bowtie2:v2.4.1_cv1'
+  fastqc: 'docker://quay.io/biocontainers/fastqc:0.12.1--hdfd78af_0'
+  gatk: 'docker://broadinstitute/gatk:4.4.0.0'
+  samtools: 'docker://biocontainers/samtools:v1.9-4-deb_cv1'
+  star: 'docker://quay.io/biocontainers/star:2.7.11a--h0033a41_0'

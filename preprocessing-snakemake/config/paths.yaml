@@ -1,0 +1,22 @@
+paths:
+  config: "logs/config_{date}.yaml"
+
+  slurm_output: "logs/slurm"
+
+  trimmed_fastq: "fastqs/{replicate}/trimmed/{sample}_{read}.fq.gz"
+  trimmed_unpaired: "fastqs/{replicate}/trimmed/{sample}_unpaired_{read}.fq.gz"
+
+  barcode_fastq: "fastqs/{replicate}/barcoded/{sample}_{read}.barcoded.fastq.gz"
+  filtered_fastq: "fastqs/{replicate}/barcoded/{sample}_{read}.filtered.fastq"
+
+  aligned_files: "alignments/{step}/{sample}.{desc}.{ext}"
+
+  clusters: "clusters/{dedup_by}/{sample}.clusters.gz"
+  clusters_csv: "clusters/{dedup_by}/{sample}.csv.gz"
+
+  cluster_qc: "OVERALL.tag_counts.txt"
+  cluster_ligation: "OVERALL.cluster_ligation_efficiency.txt"
+
+  ligation_qc: "logs/ligation/"
+  fastqc: "logs/fastqc/{replicate}/{sample}-read-{read}_fastqc.{ext}"
+  multiqc: "logs/qc/multiqc_report.html"
