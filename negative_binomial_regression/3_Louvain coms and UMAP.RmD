@@ -1,0 +1,143 @@
+---
+title: "Untitled"
+output: html_document
+date: "2024-02-10"
+---
+
+
+```{r}
+require(Matrix)
+require(tidyverse)
+require(Rspectra)
+require(igraph)
+require(ggrepel)
+require(umap)
+require(dplyr)
+require(foreach)
+library(RANN)
+
+dir = "working_directory/prefix "
+
+edges1x = read_csv(paste0(dir,"20clustsizemax no_readcount_z dist_strand gxgpairwise.csv"))
+
+head(edges1x)
+```
+```{r}
+edges1x2 = edges1x %>% rename(geneB = geneA, geneA = geneB)
+head(edges1x2)
+
+nrow(edges1x)*2
+edges2x = rbind(edges1x, edges1x2) %>% distinct()
+nrow(edges2x)
+
+rm(edges1x2)
+head(edges2x)
+```
+```{r}
+bygeneA = edges2x %>% group_by(geneA) %>% summarise(maxz = max(zscore), 
+                                                    coloc_partners = sum(pearson_resid > 1),
+                                                    total_ints = sum(interactions), 
+                                                    maxPR = max(pearson_resid))
+
+head(bygeneA)
+```
+
+Louvain community analysis forces every gene into a hub. I recommend filtering for genes that have evidence of real colocalization specificity by filtering for max z-score or by number of colocalization partners. 
+z-score reflects confidence of colocalization and is correlated to abundance. 
+The Pearson residual is the deviation from expected colocalization and is not strongly correlated to abundance in our datasets. 
+```{r}
+bygeneA_filt = bygeneA %>% filter(maxz > 3.2)
+nrow(bygeneA_filt)
+nrow(bygeneA)
+
+genes = bygeneA_filt$geneA
+
+edges_filt = edges2x %>% filter(geneA %in% genes, geneB %in% genes)
+head(edges_filt)
+```
+
+```{r}
+PC_wider = edges_filt %>% select(geneA, geneB, pearson_resid) %>% pivot_wider(id_cols = geneA, names_from = geneB, values_from = pearson_resid) 
+    
+    #Get adjaceny matrix, genes by genes
+    #turning into a matrix
+    genexgene_mat = as.matrix(PC_wider[,2:ncol(PC_wider)])
+    rownames(genexgene_mat) = PC_wider$geneA
+    
+    #making sure it's symmetric
+    genexgene_mat = genexgene_mat[,rownames(genexgene_mat)]
+    
+    #don't want to be looking at deviation from expectation for non-colocalizing
+    genexgene_mat[(genexgene_mat < 0)] <- 0
+    
+    genexgene_mat[is.na(genexgene_mat)] <- 0
+    genexgene_mat[is.infinite(genexgene_mat)] <- 0
+    
+    dim(genexgene_mat)
+```
+
+saveRDS(genexgene_mat, file = "genexgene_mat.rds")
+
+
+```{r}
+total_variance = sum(genexgene_mat * genexgene_mat)
+
+#PCA, 5 PCs
+SVD = RSpectra::svds(genexgene_mat, 5)
+  
+#proportion of variance per PC
+pve = SVD$d^2 / total_variance
+print(plot(pve))
+
+#cumulative variance explained
+print(plot(cumsum(pve)))
+
+#scaling with variance explained
+svds_scaled = SVD$u * SVD$d
+```
+ 
+
+```{r}
+PCA = svds_scaled
+
+# Calculate the nearest neighbors  
+nn_graph <- RANN::nn2(PCA, k = 100)  # k represents the number of nearest neighbors
+
+# Extract the indices of the nearest neighbors
+  indices <- nn_graph$nn.idx
+  
+  # Create an adjacency matrix for the nearest neighbor graph, neighbors = 1, everything else 0
+  adj_matrix <- matrix(0, nrow = nrow(PCA), ncol = nrow(PCA))
+  for (i in 1:nrow(PCA)) {
+    adj_matrix[i, indices[i, ]] <- 1
+  }
+  
+  #weighted by pearson_resid
+  graph_object <- graph_from_adjacency_matrix(adj_matrix, mode = "undirected", weighted = T)
+  
+  #change resolution to change the number of hubs
+  comms = cluster_louvain(graph_object, resolution = 0.5)
+  sizes(comms)
+```
+  
+```{r}
+#making a UMAP
+#other UMAP metrics are manhattan, euclidean, or pearson
+UMAP <- umap(svds_scaled, metric = "cosine", n_neighbors = 50, input = "data")
+```
+
+
+```{r, fig.width = 5, fig.height = 5}
+to_plot2 <- UMAP$layout %>% as_tibble() %>% mutate(geneA = rownames(genexgene_mat))
+to_plot2$Community = as.factor(to_plot2$Community)
+
+ggplot(to_plot2, aes(V1, V2, color = Community, fill = Community)) + 
+  geom_point(alpha = 0.2) +  
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) + 
+  theme_classic() + 
+  #theme(legend.position="none") + 
+  theme(text = element_text(size = 20, color = "black"))
+```
+
+write_csv(to_plot2, "UMAP coordinates.csv")
+
